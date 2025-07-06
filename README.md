@@ -291,7 +291,7 @@ turbogate/
 
 ## License
 
-[Add your license information here]
+[\LICENSE\]](LICENSE)
 
 ## Support
 
