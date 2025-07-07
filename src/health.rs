@@ -14,7 +14,6 @@ use tracing::{debug, info, warn, error};
 pub enum ServerStatus {
     Up,
     Down,
-    Maintenance,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +49,6 @@ struct BackendHealthState {
     servers: HashMap<String, HealthState>,
     rise_threshold: u32,
     fall_threshold: u32,
-    check_interval: Duration,
     check_timeout: Duration,
 }
 
@@ -63,9 +61,6 @@ impl HealthChecker {
         let fall_threshold = config.health_check.as_ref()
             .map(|hc| hc.fall)
             .unwrap_or(3);
-        let check_interval = config.health_check.as_ref()
-            .and_then(|hc| parse_duration(&hc.interval))
-            .unwrap_or(Duration::from_secs(2));
         let check_timeout = config.health_check.as_ref()
             .and_then(|hc| parse_duration(&hc.timeout))
             .unwrap_or(Duration::from_secs(1));
@@ -80,7 +75,6 @@ impl HealthChecker {
             servers,
             rise_threshold,
             fall_threshold,
-            check_interval,
             check_timeout,
         };
 
@@ -113,7 +107,9 @@ impl HealthChecker {
         loop {
             let backend_name = config.name.clone();
             
-            if let Some(backend_state) = backends.read().await.get(&backend_name) {
+            let backend_state_opt = backends.read().await.get(&backend_name).cloned();
+            
+            if let Some(backend_state) = backend_state_opt {
                 let mut updated_servers = backend_state.servers.clone();
                 
                 for server in &config.server {
@@ -124,30 +120,19 @@ impl HealthChecker {
                     }
                 }
 
-                // Освобождаем read lock перед получением write lock
                 drop(backends.read().await);
 
-                // Обновляем состояние
                 {
                     debug!("Updating backend state");
-                    match tokio::time::timeout(Duration::from_secs(1), async {
-                        let mut backends_write = backends.write().await;
-                        if let Some(backend_state) = backends_write.get_mut(&backend_name) {
-                            backend_state.servers = updated_servers.clone();
-                            debug!("Backend state updated successfully");
-                        } else {
-                            warn!("Failed to update backend state - backend not found");
-                        }
-                    }).await {
-                        Ok(_) => debug!("Backend state update completed"),
-                        Err(_) => {
-                            error!("Backend state update timed out - possible deadlock");
-                            return;
-                        }
+                    let mut backends_write = backends.write().await;
+                    if let Some(backend_state) = backends_write.get_mut(&backend_name) {
+                        backend_state.servers = updated_servers.clone();
+                        debug!("Backend state updated successfully");
+                    } else {
+                        warn!("Failed to update backend state - backend not found");
                     }
                 }
 
-                // Логируем статистику
                 let active_servers = updated_servers.values()
                     .filter(|state| matches!(state.status, ServerStatus::Up))
                     .count();
@@ -267,7 +252,7 @@ impl HealthChecker {
         if let Some(backend_state) = backends.get_mut(&self.config.name) {
             if let Some(health_state) = backend_state.servers.get_mut(server_name) {
                 health_state.status = if maintenance {
-                    ServerStatus::Maintenance
+                    ServerStatus::Down
                 } else {
                     ServerStatus::Up
                 };
@@ -321,7 +306,6 @@ impl HealthChecker {
             if let Err(e) = async {
                 debug!("Running health checks for backend '{}'", backend_name);
                 
-                // Получаем данные и сразу освобождаем read lock
                 let backend_state_opt = backends.read().await.get(&backend_name).cloned();
                 if let Some(backend_state) = backend_state_opt {
                     debug!("Found backend state, checking {} servers", backend_state.servers.len());
@@ -340,7 +324,6 @@ impl HealthChecker {
                         }
                     }
 
-                    // Сохраняем обновленное состояние обратно в основное хранилище
                     {
                         debug!("Saving updated health state for backend '{}'", backend_name);
                         match tokio::time::timeout(Duration::from_secs(1), async {
@@ -360,7 +343,6 @@ impl HealthChecker {
                         }
                     }
 
-                    // Обновляем shared state для интеграции с балансировщиком
                     {
                         debug!("Updating shared state for backend '{}'", backend_name);
                         match tokio::time::timeout(Duration::from_secs(1), async {
@@ -388,7 +370,6 @@ impl HealthChecker {
                         }
                     }
 
-                    // Логируем статистику
                     let active_servers = updated_servers.values()
                         .filter(|state| matches!(state.status, ServerStatus::Up))
                         .count();
@@ -429,67 +410,6 @@ fn parse_duration(s: &str) -> Option<Duration> {
     } else if s.ends_with('h') {
         s[..s.len()-1].parse::<u64>().ok().map(|h| Duration::from_secs(h * 3600))
     } else {
-        // Попробуем как секунды
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
-}
-
-// HTTP health check (для будущего расширения)
-pub async fn perform_http_health_check(
-    addr: &str,
-    path: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    
-    let socket_addr: SocketAddr = addr.parse()?;
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(socket_addr)).await??;
-    
-    let request = format!(
-        "GET {} HTTP/1.1\r\n\
-         Host: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        path, addr
-    );
-    
-    let (mut read, mut write) = stream.into_split();
-    write.write_all(request.as_bytes()).await?;
-    drop(write);
-    
-    let mut response = Vec::new();
-    read.read_to_end(&mut response).await?;
-    
-    let response_str = String::from_utf8_lossy(&response);
-    if response_str.contains("200 OK") {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("HTTP health check failed: {}", response_str.lines().next().unwrap_or("Unknown")))
-    }
-}
-
-// TCP health check с кастомными данными
-pub async fn perform_tcp_health_check_with_data(
-    addr: &str,
-    data: &[u8],
-    expected_response: Option<&[u8]>,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    
-    let socket_addr: SocketAddr = addr.parse()?;
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(socket_addr)).await??;
-    
-    stream.write_all(data).await?;
-    
-    if let Some(expected) = expected_response {
-        let mut response = vec![0; expected.len()];
-        let n = tokio::time::timeout(timeout, stream.read(&mut response)).await??;
-        
-        if n != expected.len() || &response[..n] != expected {
-            return Err(anyhow::anyhow!("Unexpected response from health check"));
-        }
-    }
-    
-    Ok(())
 }

@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use tokio::fs;
 use anyhow::{Result, anyhow};
 use tracing::{debug, warn, info};
 use crate::options::Options;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -14,6 +14,10 @@ pub struct Config {
     pub frontends: Vec<FrontendConfig>,
     pub backends: Vec<BackendConfig>,
     pub metrics: MetricsConfig,
+    pub rate_limit: Option<RateLimitConfig>,
+    pub ddos_protection: Option<DdosProtectionConfig>,
+    pub hot_reload: Option<HotReloadConfig>,
+    pub compression: Option<CompressionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +30,7 @@ pub struct GlobalConfig {
     pub pidfile: Option<String>,
     pub ssl_default_bind_ciphers: Option<String>,
     pub ssl_default_bind_options: Option<String>,
+    pub option: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,9 +124,12 @@ impl Config {
             frontends: Vec::new(),
             backends: Vec::new(),
             metrics: MetricsConfig::default(),
+            rate_limit: None,
+            ddos_protection: None,
+            hot_reload: None,
+            compression: None,
         };
         
-        // Список stats bind адресов
         let mut stats_binds = Vec::new();
 
         let mut current_section = None;
@@ -131,7 +139,6 @@ impl Config {
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
             
-            // Пропускаем комментарии и пустые строки
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -140,23 +147,19 @@ impl Config {
 
             match parse_line(line, line_num + 1)? {
                 LineType::Section(section) => {
-                        // Сохраняем предыдущую секцию
-    if let Some(mut frontend) = current_frontend.take() {
-        // Создаем Options для frontend
-        let mode = frontend.mode.as_deref().unwrap_or("tcp");
-        frontend.options = Some(Options::from_strings(&frontend.option, mode)?);
-        config.frontends.push(frontend);
-    }
-    if let Some(mut backend) = current_backend.take() {
-        // Создаем Options для backend
-        let mode = backend.mode.as_deref().unwrap_or("tcp");
-        backend.options = Some(Options::from_strings(&backend.option, mode)?);
-        
-        // Создаем HealthCheckConfig из параметров серверов
-        backend.health_check = create_health_check_config(&backend);
-        
-        config.backends.push(backend);
-    }
+                    if let Some(mut frontend) = current_frontend.take() {
+                        let mode = frontend.mode.as_deref().unwrap_or("tcp");
+                        frontend.options = Some(Options::from_strings(&frontend.option, mode)?);
+                        config.frontends.push(frontend);
+                    }
+                    if let Some(mut backend) = current_backend.take() {
+                        let mode = backend.mode.as_deref().unwrap_or("tcp");
+                        backend.options = Some(Options::from_strings(&backend.option, mode)?);
+                        
+                        backend.health_check = create_health_check_config(&backend);
+                        
+                        config.backends.push(backend);
+                    }
 
                     current_section = Some(section.clone());
                     match section.as_str() {
@@ -229,7 +232,6 @@ impl Config {
             }
         }
 
-        // Сохраняем последние секции
         if let Some(mut frontend) = current_frontend {
             let mode = frontend.mode.as_deref().unwrap_or("tcp");
             frontend.options = Some(Options::from_strings(&frontend.option, mode)?);
@@ -239,28 +241,27 @@ impl Config {
             let mode = backend.mode.as_deref().unwrap_or("tcp");
             backend.options = Some(Options::from_strings(&backend.option, mode)?);
             
-            // Создаем HealthCheckConfig из параметров серверов
             backend.health_check = create_health_check_config(&backend);
             
             config.backends.push(backend);
         }
 
-        // Создаем Options для defaults
         let mode = config.defaults.mode.as_deref().unwrap_or("tcp");
         config.defaults.options = Some(Options::from_strings(&config.defaults.option, mode)?);
 
-        // Настраиваем метрики на основе stats bind
         if !stats_binds.is_empty() {
-            // Используем первый stats bind адрес
             config.metrics.bind = Some(stats_binds[0].clone());
             info!("Metrics will be available on: {}", stats_binds[0]);
         }
+
+        Self::parse_rate_limit_config(&mut config)?;
+        Self::parse_ddos_protection_config(&mut config)?;
+        Self::parse_compression_config(&mut config)?;
 
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
-        // Проверяем, что все frontend'ы ссылаются на существующие backend'ы
         let backend_names: std::collections::HashSet<_> = self.backends.iter()
             .map(|b| &b.name)
             .collect();
@@ -281,7 +282,6 @@ impl Config {
             }
         }
 
-        // Проверяем, что у каждого backend'а есть хотя бы один сервер
         for backend in &self.backends {
             if backend.server.is_empty() {
                 return Err(anyhow!("Backend '{}' has no servers", backend.name));
@@ -332,12 +332,99 @@ fn parse_global_directive(global: &mut GlobalConfig, key: &str, value: &str) -> 
         "ssl-default-bind-ciphers" => global.ssl_default_bind_ciphers = Some(value.to_string()),
         "ssl-default-bind-options" => global.ssl_default_bind_options = Some(value.to_string()),
         "stats" => {
-            // Поддержка stats bind для метрик
             if value.starts_with("bind") {
                 let parts: Vec<&str> = value.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    // Это будет обработано в Config::from_haproxy_config
                 }
+            }
+        },
+        "rate-limit" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "requests-per-second" => {
+                        if let Ok(rate) = parts[1].parse::<u32>() {
+                            global.option.push(format!("rate-limit-rps {}", rate));
+                        }
+                    },
+                    "burst-size" => {
+                        if let Ok(burst) = parts[1].parse::<u32>() {
+                            global.option.push(format!("rate-limit-burst {}", burst));
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        },
+        "ddos-protection" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "max-requests-per-minute" => {
+                        if let Ok(max_req) = parts[1].parse::<u32>() {
+                            global.option.push(format!("ddos-protection max-requests-per-minute {}", max_req));
+                            debug!("Parsed DDoS max-requests-per-minute: {}", max_req);
+                        }
+                    },
+                    "max-connections-per-ip" => {
+                        if let Ok(max_conn) = parts[1].parse::<u32>() {
+                            global.option.push(format!("ddos-protection max-connections-per-ip {}", max_conn));
+                            debug!("Parsed DDoS max-connections-per-ip: {}", max_conn);
+                        }
+                    },
+                    "reset-interval-seconds" => {
+                        if let Ok(interval) = parts[1].parse::<u64>() {
+                            global.option.push(format!("ddos-protection reset-interval-seconds {}", interval));
+                            debug!("Parsed DDoS reset-interval-seconds: {}", interval);
+                        }
+                    },
+                    "suspicious-pattern" => {
+                        let patterns: Vec<&str> = parts[1].split(&[',', ' '][..]).filter(|s| !s.trim().is_empty()).map(|s| s.trim()).collect();
+                        for pattern in patterns {
+                            global.option.push(format!("ddos-protection suspicious-pattern {}", pattern));
+                            debug!("Parsed DDoS suspicious-pattern: {}", pattern);
+                        }
+                    },
+                    "whitelist" => {
+                        let ips: Vec<&str> = parts[1].split(&[',', ' '][..]).filter(|s| !s.trim().is_empty()).map(|s| s.trim()).collect();
+                        for ip in ips {
+                            global.option.push(format!("ddos-protection whitelist {}", ip));
+                            debug!("Parsed DDoS whitelist: {}", ip);
+                        }
+                    },
+                    "blacklist" => {
+                        let ips: Vec<&str> = parts[1].split(&[',', ' '][..]).filter(|s| !s.trim().is_empty()).map(|s| s.trim()).collect();
+                        for ip in ips {
+                            global.option.push(format!("ddos-protection blacklist {}", ip));
+                            debug!("Parsed DDoS blacklist: {}", ip);
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        },
+        "compression-gzip" => {
+            global.option.push(format!("compression-gzip {}", value));
+        },
+        "compression-brotli" => {
+            global.option.push(format!("compression-brotli {}", value));
+        },
+        "compression-deflate" => {
+            global.option.push(format!("compression-deflate {}", value));
+        },
+        "compression-min-size" => {
+            if let Ok(size) = value.parse::<usize>() {
+                global.option.push(format!("compression-min-size {}", size));
+            }
+        },
+        "compression-max-size" => {
+            if let Ok(size) = value.parse::<usize>() {
+                global.option.push(format!("compression-max-size {}", size));
+            }
+        },
+        "compression-level" => {
+            if let Ok(level) = value.parse::<u32>() {
+                global.option.push(format!("compression-level {}", level));
             }
         },
         _ => warn!("Unknown global directive: {}", key),
@@ -355,7 +442,6 @@ fn parse_defaults_directive(defaults: &mut DefaultsConfig, key: &str, value: &st
             if parts.len() >= 2 {
                 defaults.timeout.insert(parts[0].to_string(), parts[1].to_string());
                 
-                // Применяем timeout к options
                 if defaults.options.is_none() {
                     defaults.options = Some(crate::options::Options::default());
                 }
@@ -367,6 +453,100 @@ fn parse_defaults_directive(defaults: &mut DefaultsConfig, key: &str, value: &st
             }
         },
         "retries" => defaults.retries = Some(value.parse()?),
+        "rate-limit" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "requests-per-second" => {
+                        if let Ok(rate) = parts[1].parse::<u32>() {
+                            defaults.option.push(format!("rate-limit-rps {}", rate));
+                        }
+                    },
+                    "burst-size" => {
+                        if let Ok(burst) = parts[1].parse::<u32>() {
+                            defaults.option.push(format!("rate-limit-burst {}", burst));
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        },
+        "ddos-protection" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "max-requests-per-minute" => {
+                        if let Ok(max_req) = parts[1].parse::<u32>() {
+                            defaults.option.push(format!("ddos-protection max-requests-per-minute {}", max_req));
+                        }
+                    },
+                    "max-connections-per-ip" => {
+                        if let Ok(max_conn) = parts[1].parse::<u32>() {
+                            defaults.option.push(format!("ddos-protection max-connections-per-ip {}", max_conn));
+                        }
+                    },
+                    "reset-interval-seconds" => {
+                        if let Ok(interval) = parts[1].parse::<u64>() {
+                            defaults.option.push(format!("ddos-protection reset-interval-seconds {}", interval));
+                        }
+                    },
+                    "suspicious-pattern" => {
+                        defaults.option.push(format!("ddos-protection suspicious-pattern {}", parts[1]));
+                    },
+                    "whitelist" => {
+                        defaults.option.push(format!("ddos-protection whitelist {}", parts[1]));
+                    },
+                    "blacklist" => {
+                        defaults.option.push(format!("ddos-protection blacklist {}", parts[1]));
+                    },
+                    _ => {}
+                }
+            }
+        },
+        "compression" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "gzip" | "brotli" | "deflate" => {
+                        if parts[1] == "enabled" {
+                            defaults.option.push(format!("compression-{} enabled", parts[0]));
+                        }
+                    },
+                    "min-size" => {
+                        if let Ok(size) = parts[1].parse::<usize>() {
+                            defaults.option.push(format!("compression-min-size {}", size));
+                        }
+                    },
+                    "max-size" => {
+                        if let Ok(size) = parts[1].parse::<usize>() {
+                            defaults.option.push(format!("compression-max-size {}", size));
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        },
+        "http2" | "http3" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 1 {
+                if parts[0] == "enabled" {
+                    defaults.option.push(format!("{}-enabled", key));
+                }
+                if parts.len() >= 2 {
+                    defaults.option.push(format!("{}-{} {}", key, parts[0], parts[1]));
+                }
+            }
+        },
+        "hot-reload" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 1 {
+                if parts[0] == "enabled" {
+                    defaults.option.push("hot-reload-enabled".to_string());
+                } else if parts.len() >= 2 {
+                    defaults.option.push(format!("hot-reload-{} {}", parts[0], parts[1]));
+                }
+            }
+        },
         _ => warn!("Unknown defaults directive: {}", key),
     }
     
@@ -375,7 +555,15 @@ fn parse_defaults_directive(defaults: &mut DefaultsConfig, key: &str, value: &st
 
 fn parse_frontend_directive(frontend: &mut FrontendConfig, key: &str, value: &str) -> Result<()> {
     match key {
-        "bind" => frontend.bind.push(value.to_string()),
+        "bind" => {
+            let bind_value = if value.trim().starts_with("*:") {
+                let port = &value.trim()[2..];
+                format!("0.0.0.0:{}", port)
+            } else {
+                value.to_string()
+            };
+            frontend.bind.push(bind_value)
+        },
         "mode" => frontend.mode = Some(value.to_string()),
         "default_backend" => frontend.default_backend = Some(value.to_string()),
         "acl" => {
@@ -402,7 +590,6 @@ fn parse_frontend_directive(frontend: &mut FrontendConfig, key: &str, value: &st
             if parts.len() >= 2 {
                 frontend.timeout.insert(parts[0].to_string(), parts[1].to_string());
                 
-                // Применяем timeout к options
                 if frontend.options.is_none() {
                     frontend.options = Some(crate::options::Options::default());
                 }
@@ -411,6 +598,52 @@ fn parse_frontend_directive(frontend: &mut FrontendConfig, key: &str, value: &st
                         warn!("Failed to apply timeout {} {}: {}", parts[0], parts[1], e);
                     }
                 }
+            }
+        },
+        "http-request" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 3 {
+                match parts[0] {
+                    "set-header" | "add-header" => {
+                        frontend.option.push(format!("http-request-{}-header {} {}", parts[0], parts[1], parts[2]));
+                    },
+                    _ => {},
+                }
+            }
+        },
+        "http-response" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.len() >= 3 {
+                match parts[0] {
+                    "set-header" | "add-header" => {
+                        frontend.option.push(format!("http-response-{}-header {} {}", parts[0], parts[1], parts[2]));
+                    },
+                    _ => {},
+                }
+            }
+        },
+        "compression-gzip" => {
+            frontend.option.push(format!("compression-gzip {}", value));
+        },
+        "compression-brotli" => {
+            frontend.option.push(format!("compression-brotli {}", value));
+        },
+        "compression-deflate" => {
+            frontend.option.push(format!("compression-deflate {}", value));
+        },
+        "compression-min-size" => {
+            if let Ok(size) = value.parse::<usize>() {
+                frontend.option.push(format!("compression-min-size {}", size));
+            }
+        },
+        "compression-max-size" => {
+            if let Ok(size) = value.parse::<usize>() {
+                frontend.option.push(format!("compression-max-size {}", size));
+            }
+        },
+        "compression-level" => {
+            if let Ok(level) = value.parse::<u32>() {
+                frontend.option.push(format!("compression-level {}", level));
             }
         },
         _ => warn!("Unknown frontend directive: {}", key),
@@ -423,7 +656,6 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
     match key {
         "mode" => backend.mode = Some(value.to_string()),
         "balance" => {
-            // Извлекаем первый алгоритм балансировки (до комментария или пробела)
             let algorithm = value.split('#').next().unwrap_or(value).trim();
             backend.balance = Some(algorithm.to_string());
         },
@@ -434,7 +666,6 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
                 let server_addr = parts[1].to_string();
                 let server_name_clone = server_name.clone();
                 
-                // Разбираем адрес и порт
                 let (address, port) = if server_addr.contains(':') {
                     let addr_parts: Vec<&str> = server_addr.split(':').collect();
                     if addr_parts.len() == 2 {
@@ -450,7 +681,7 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
                     name: server_name,
                     address,
                     port,
-                    weight: Some(1), // По умолчанию вес 1
+                    weight: Some(1),
                     maxconn: None,
                     check: None,
                     inter: None,
@@ -460,7 +691,6 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
                     disabled: None,
                 };
 
-                // Парсим дополнительные параметры
                 let mut i = 2;
                 while i < parts.len() {
                     let part = parts[i];
@@ -470,18 +700,16 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
                                 let weight_str = parts[i + 1];
                                 server.weight = Some(weight_str.parse().unwrap_or(1));
                                 tracing::debug!("Parsed weight for server {}: {}", server_name_clone, server.weight.unwrap());
-                                i += 2; // Пропускаем и "weight" и значение
-                            } else {
-                                i += 1;
+                                i += 2;
                             }
+                            i += 1;
                         },
                         "maxconn" => {
                             if i + 1 < parts.len() {
                                 server.maxconn = Some(parts[i + 1].parse().unwrap_or(1000));
                                 i += 2;
-                            } else {
-                                i += 1;
                             }
+                            i += 1;
                         },
                         "check" => {
                             server.check = Some(true);
@@ -491,25 +719,22 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
                             if i + 1 < parts.len() {
                                 server.inter = Some(parts[i + 1].to_string());
                                 i += 2;
-                            } else {
-                                i += 1;
                             }
+                            i += 1;
                         },
                         "rise" => {
                             if i + 1 < parts.len() {
                                 server.rise = Some(parts[i + 1].parse().unwrap_or(2));
                                 i += 2;
-                            } else {
-                                i += 1;
                             }
+                            i += 1;
                         },
                         "fall" => {
                             if i + 1 < parts.len() {
                                 server.fall = Some(parts[i + 1].parse().unwrap_or(3));
                                 i += 2;
-                            } else {
-                                i += 1;
                             }
+                            i += 1;
                         },
                         "backup" => {
                             server.backup = Some(true);
@@ -520,9 +745,8 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
                             i += 1;
                         },
                         _ => {
-                            // Неизвестный параметр, пропускаем
                             i += 1;
-                        }
+                        },
                     }
                 }
 
@@ -537,7 +761,6 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
             if parts.len() >= 2 {
                 backend.timeout.insert(parts[0].to_string(), parts[1].to_string());
                 
-                // Применяем timeout к options
                 if backend.options.is_none() {
                     backend.options = Some(crate::options::Options::default());
                 }
@@ -554,14 +777,12 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
     Ok(())
 }
 
-// Создаем HealthCheckConfig из параметров серверов
 fn create_health_check_config(backend: &BackendConfig) -> Option<HealthCheckConfig> {
     let mut interval = "2s".to_string();
     let timeout = "1s".to_string();
     let mut rise = 2;
     let mut fall = 3;
     
-    // Ищем параметры health check среди серверов с health check
     for server in &backend.server {
         if server.check.unwrap_or(false) {
             if let Some(ref inter) = server.inter {
@@ -573,12 +794,10 @@ fn create_health_check_config(backend: &BackendConfig) -> Option<HealthCheckConf
             if let Some(fall_val) = server.fall {
                 fall = fall_val;
             }
-            // Берем параметры только от первого сервера с health check
             break;
         }
     }
     
-    // Создаем конфигурацию только если есть серверы с health check
     let has_health_check = backend.server.iter().any(|s| s.check.unwrap_or(false));
     if has_health_check {
         Some(HealthCheckConfig {
@@ -603,6 +822,7 @@ impl Default for GlobalConfig {
             pidfile: None,
             ssl_default_bind_ciphers: Some("EECDH+AESGCM:EDH+AESGCM".to_string()),
             ssl_default_bind_options: Some("no-sslv3".to_string()),
+            option: Vec::new(),
         }
     }
 }
@@ -627,5 +847,195 @@ impl Default for MetricsConfig {
             bind: Some("0.0.0.0:9090".to_string()),
             path: Some("/metrics".to_string()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    pub requests_per_second: u32,
+    pub burst_size: u32,
+    pub window_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdosProtectionConfig {
+    pub reset_interval_seconds: u64,
+    pub max_requests_per_minute: Option<u32>,
+    pub max_connections_per_ip: Option<u32>,
+    pub suspicious_patterns: Vec<String>,
+    pub whitelist: Vec<String>,
+    pub blacklist: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotReloadConfig {
+    pub enabled: bool,
+    pub watch_interval: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    pub gzip_enabled: bool,
+    pub brotli_enabled: bool,
+    pub deflate_enabled: bool,
+    pub min_size: usize,
+    pub max_size: usize,
+    pub compression_level: u32,
+    pub content_types: Vec<String>,
+}
+
+impl Config {
+    fn parse_rate_limit_config(config: &mut Config) -> Result<()> {
+        let mut requests_per_second = None;
+        let mut burst_size = None;
+        let window_size = 1;
+
+        for option in &config.global.option {
+            let parts: Vec<&str> = option.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "rate-limit-rps" => {
+                        if let Ok(rate) = parts[1].parse::<u32>() {
+                            requests_per_second = Some(rate);
+                        }
+                    },
+                    "rate-limit-burst" => {
+                        if let Ok(burst) = parts[1].parse::<u32>() {
+                            burst_size = Some(burst);
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        if let (Some(rps), Some(burst)) = (requests_per_second, burst_size) {
+            config.rate_limit = Some(RateLimitConfig {
+                requests_per_second: rps,
+                burst_size: burst,
+                window_size,
+            });
+            info!("Rate limiting configured: {} req/s, burst: {}", rps, burst);
+        }
+
+        Ok(())
+    }
+
+    fn parse_ddos_protection_config(config: &mut Config) -> Result<()> {
+        let mut reset_interval_seconds = 60;
+        let mut max_requests_per_minute = None;
+        let mut max_connections_per_ip = None;
+        let mut suspicious_patterns = Vec::new();
+        let mut whitelist = Vec::new();
+        let mut blacklist = Vec::new();
+
+        for option in &config.global.option {
+            let parts: Vec<&str> = option.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "ddos-protection" => {
+                        if parts.len() >= 3 {
+                            match parts[1] {
+                                "reset-interval-seconds" => {
+                                    if let Ok(val) = parts[2].parse::<u64>() {
+                                        reset_interval_seconds = val;
+                                    }
+                                },
+                                "max-requests-per-minute" => {
+                                    if let Ok(val) = parts[2].parse::<u32>() {
+                                        max_requests_per_minute = Some(val);
+                                    }
+                                },
+                                "max-connections-per-ip" => {
+                                    if let Ok(val) = parts[2].parse::<u32>() {
+                                        max_connections_per_ip = Some(val);
+                                    }
+                                },
+                                "suspicious-pattern" => {
+                                    suspicious_patterns.push(parts[2].to_string());
+                                },
+                                "whitelist" => {
+                                    whitelist.push(parts[2].to_string());
+                                },
+                                "blacklist" => {
+                                    blacklist.push(parts[2].to_string());
+                                },
+                                _ => {}
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        config.ddos_protection = Some(DdosProtectionConfig {
+            reset_interval_seconds,
+            max_requests_per_minute,
+            max_connections_per_ip,
+            suspicious_patterns,
+            whitelist,
+            blacklist,
+        });
+
+        Ok(())
+    }
+
+    fn parse_compression_config(config: &mut Config) -> Result<()> {
+        let mut gzip_enabled = false;
+        let mut brotli_enabled = false;
+        let mut deflate_enabled = false;
+        let mut min_size = 1024;
+        let mut max_size = 1024 * 1024;
+        let mut compression_level = 6;
+        let content_types = vec![
+            "text/plain".to_string(),
+            "text/html".to_string(),
+            "text/css".to_string(),
+            "application/javascript".to_string(),
+            "application/json".to_string(),
+        ];
+
+        for option in &config.global.option {
+            let parts: Vec<&str> = option.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "compression-gzip" => gzip_enabled = parts[1] == "enabled",
+                    "compression-brotli" => brotli_enabled = parts[1] == "enabled",
+                    "compression-deflate" => deflate_enabled = parts[1] == "enabled",
+                    "compression-min-size" => {
+                        if let Ok(size) = parts[1].parse::<usize>() {
+                            min_size = size;
+                        }
+                    }
+                    "compression-max-size" => {
+                        if let Ok(size) = parts[1].parse::<usize>() {
+                            max_size = size;
+                        }
+                    },
+                    "compression-level" => {
+                        if let Ok(level) = parts[1].parse::<u32>() {
+                            compression_level = level;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if gzip_enabled || brotli_enabled || deflate_enabled {
+            config.compression = Some(CompressionConfig {
+                gzip_enabled,
+                brotli_enabled,
+                deflate_enabled,
+                min_size,
+                max_size,
+                compression_level,
+                content_types,
+            });
+            info!("Compression configured: gzip={}, brotli={}, deflate={}", gzip_enabled, brotli_enabled, deflate_enabled);
+        }
+
+        Ok(())
     }
 }

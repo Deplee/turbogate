@@ -24,13 +24,6 @@ impl Metrics {
     }
 }
 
-// --- Свободные функции метрик ---
-
-pub fn connection_accepted(frontend: &str) {
-    counter!("turbogate_connections_total", 1, "frontend" => frontend.to_string());
-    gauge!("turbogate_active_connections", 1.0, "frontend" => frontend.to_string());
-}
-
 pub fn connection_closed(frontend: &str) {
     gauge!("turbogate_active_connections", -1.0, "frontend" => frontend.to_string());
 }
@@ -77,12 +70,6 @@ pub fn request_failed(backend: &str, server: &str, error_type: &str) {
     gauge!("turbogate_active_requests", -1.0, 
            "backend" => backend.to_string(), 
            "server" => server.to_string());
-}
-
-pub fn bytes_transferred(frontend: &str, direction: &str, bytes: u64) {
-    counter!("turbogate_bytes_transferred_total", bytes, 
-            "frontend" => frontend.to_string(), 
-            "direction" => direction.to_string());
 }
 
 pub fn backend_active_servers(backend: &str, count: usize) {
@@ -179,60 +166,4 @@ async fn run_metrics_server(
     }
 }
 
-// Утилиты для работы с метриками
-pub fn record_connection_stats(frontend: &str, active: u64, total: u64) {
-    gauge!("turbogate_connection_stats_active", active as f64, 
-           "frontend" => frontend.to_string());
-    gauge!("turbogate_connection_stats_total", total as f64, 
-           "frontend" => frontend.to_string());
-}
 
-pub fn record_backend_health(backend: &str, healthy_servers: usize, total_servers: usize) {
-    gauge!("turbogate_backend_health_ratio", 
-           healthy_servers as f64 / total_servers as f64, 
-           "backend" => backend.to_string());
-}
-
-pub fn record_error_rate(frontend: &str, error_rate: f64) {
-    gauge!("turbogate_error_rate", error_rate, 
-           "frontend" => frontend.to_string());
-}
-
-pub fn record_response_time_percentile(backend: &str, percentile: f64, value_ms: f64) {
-    gauge!("turbogate_response_time_percentile", value_ms, 
-           "backend" => backend.to_string(), 
-           "percentile" => percentile.to_string());
-}
-
-// Функция для записи детальных метрик времени выполнения
-pub fn record_detailed_timing_metrics(
-    backend: &str, 
-    server: &str, 
-    duration_ms: u64,
-    connection_time_ms: Option<u64>,
-    transfer_time_ms: Option<u64>,
-) {
-    // Общее время выполнения
-    histogram!("turbogate_total_duration_ms", duration_ms as f64, 
-              "backend" => backend.to_string(), 
-              "server" => server.to_string());
-    
-    // Время установки соединения (если доступно)
-    if let Some(conn_time) = connection_time_ms {
-        histogram!("turbogate_connection_time_ms", conn_time as f64, 
-                  "backend" => backend.to_string(), 
-                  "server" => server.to_string());
-    }
-    
-    // Время передачи данных (если доступно)
-    if let Some(transfer_time) = transfer_time_ms {
-        histogram!("turbogate_transfer_time_ms", transfer_time as f64, 
-                  "backend" => backend.to_string(), 
-                  "server" => server.to_string());
-    }
-    
-    // Метрика производительности (запросов в секунду)
-    counter!("turbogate_requests_per_second", 1, 
-             "backend" => backend.to_string(), 
-             "server" => server.to_string());
-}

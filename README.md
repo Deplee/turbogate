@@ -1,305 +1,305 @@
-# Turbogate
+# Turbogate: Modern Load Balancer & Reverse Proxy
 
-A high-performance L4 load balancer written in Rust, compatible with HAProxy configuration format. Turbogate provides enterprise-grade load balancing with health checks, ACL support, metrics, and multiple balancing algorithms.
+## 🚀 Project Overview
 
-## Features
+**Turbogate** is a high-performance, modern load balancer and reverse proxy written in Rust, designed for simplicity, security, and ease of use. It provides enterprise-grade load balancing capabilities with built-in DDoS protection, rate limiting, and compression features.
 
-### 🚀 Core Features
-- **HAProxy-compatible configuration parser** - Use existing HAProxy configs
-- **L4 (TCP) load balancing** - Fast and efficient connection proxying
-- **Multiple balancing algorithms**:
-  - `leastconn` - Least connections
-  - `roundrobin` - Round-robin
-  - `source` - Source IP hash
-  - `random` - Random selection
-  - `weighted_roundrobin` - Weighted round-robin
-- **Health checks** with configurable `fall` and `rise` thresholds
-- **ACL (Access Control Lists)** support for IP-based filtering
-- **Prometheus metrics** integration
-- **Structured logging** with configurable levels
+## 🎯 Key Features
 
-### 🔧 Advanced Features
-- **Server weights** support for weighted algorithms
-- **Connection limits** (`maxconn`) per server
-- **Configurable timeouts** (connect, client, server, queue)
-- **TCP keep-alive** options
-- **Retry mechanisms** for failed connections
-- **Graceful degradation** - excludes unhealthy servers from balancing
+### Core Functionality
+- **TCP/HTTP Load Balancing** with multiple algorithms (Round Robin, Least Connections, Random)
+- **Health Checks** with configurable intervals and thresholds
+- **Rate Limiting** with burst support and configurable windows
+- **DDoS Protection** with IP-based filtering, suspicious pattern detection, and automatic connection limiting
+- **Compression** support for GZIP, Brotli, and Deflate
+- **Access Control Lists (ACL)** for IP-based filtering and routing
+- **Metrics & Monitoring** with Prometheus-compatible endpoints
+- **Hot Reload** for configuration changes without downtime
 
-## Quick Start
+### Advanced Features
+- **Connection Management** with TCP keep-alive support
+- **Backup Servers** for high availability
+- **Weighted Load Balancing** for fine-grained control
+- **Multiple Bind Addresses** per frontend
+- **Flexible Configuration** with HAProxy-compatible syntax
+- **Comprehensive Logging** with structured output
 
-### Installation
+## 🏆 Why Turbogate is Better Than HAProxy
 
+### 1. **Memory Safety & Security**
+- **Rust Language**: Eliminates entire classes of bugs (buffer overflows, use-after-free, data races)
+- **Memory-Safe by Design**: No manual memory management required
+- **Security-First Approach**: Built-in protection against common vulnerabilities
+
+### 2. **Built-in DDoS Protection**
+- **Native Implementation**: No external tools or complex setups needed
+- **IP-based Filtering**: Automatic connection limiting per IP
+- **Suspicious Pattern Detection**: Blocks malicious User-Agent patterns
+- **Whitelist/Blacklist Support**: Flexible IP access control
+- **Automatic Counter Reset**: Intelligent rate limiting with configurable intervals
+
+### 3. **Simplified Configuration**
+- **HAProxy-Compatible Syntax**: Easy migration from existing setups
+- **Modern Improvements**: Enhanced syntax with comma-separated values
+- **Flexible Bind Syntax**: Support for both `bind 0.0.0.0:port` and `bind *:port`
+- **Intuitive Directives**: Clear, readable configuration format
+
+### 4. **Native Rate Limiting**
+- **Integrated Support**: No external modules required
+- **Burst Handling**: Configurable burst sizes for traffic spikes
+- **Multi-level Control**: Global, frontend, and backend-specific limits
+- **Automatic Enforcement**: Seamless integration with load balancing
+
+### 5. **Modern Compression**
+- **Multiple Algorithms**: GZIP, Brotli, and Deflate support
+- **Configurable Thresholds**: Min/max size limits and compression levels
+- **Content-Type Aware**: Intelligent compression based on content
+- **Performance Optimized**: Efficient compression with minimal overhead
+
+### 6. **Hot Reload Capability**
+- **Zero Downtime**: Configuration changes without service interruption
+- **Signal-Based Reload**: Simple `SIGHUP` to reload configuration
+- **Validation**: Automatic configuration validation before reload
+- **Rollback Support**: Safe configuration updates
+
+### 7. **Single Binary Deployment**
+- **No Dependencies**: Self-contained executable
+- **Easy Distribution**: Simple deployment across environments
+- **Cross-Platform**: Runs on multiple operating systems
+- **Container Ready**: Perfect for Docker and Kubernetes deployments
+
+### 8. **Comprehensive Metrics**
+- **Prometheus Compatible**: Standard metrics format
+- **Real-time Monitoring**: Live performance and health data
+- **Custom Metrics**: Application-specific monitoring
+- **Integration Ready**: Works with existing monitoring stacks
+
+### 9. **Performance Advantages**
+- **Near-Native Speed**: Rust's zero-cost abstractions
+- **Efficient Memory Usage**: Optimal resource utilization
+- **High Concurrency**: Excellent handling of thousands of connections
+- **Low Latency**: Minimal overhead for request processing
+
+## 📊 Comparison Table
+
+| Feature | Turbogate | HAProxy |
+|---------|-----------|---------|
+| **Language** | Rust (memory-safe, fast) | C (manual memory management) |
+| **Configuration** | Simple, intuitive | Complex, verbose |
+| **DDoS Protection** | Built-in, configurable | Limited, requires external tools |
+| **Rate Limiting** | Native support | Requires external modules |
+| **Compression** | Multiple algorithms | Basic support |
+| **Hot Reload** | Native support | Limited |
+| **Memory Safety** | Guaranteed by Rust | Manual management |
+| **Performance** | Near-native speed | Optimized but complex |
+| **Security** | Memory-safe by design | Requires careful configuration |
+| **Deployment** | Single binary | Multiple dependencies |
+
+## 📦 Installation
+
+### From Source
 ```bash
-# Clone the repository
 git clone https://github.com/Deplee/turbogate.git
 cd turbogate
-
-# Build the project
 cargo build --release
-
-# Run with configuration
-./target/release/turbogate -c config.cfg
 ```
 
-### Basic Configuration
+### Binary Release
+Download the latest release from the releases page.
 
-Create a `config.cfg` file:
+## 🚀 Quick Start
 
-```haproxy
+1. **Create Configuration**
+```bash
+cp examples/example.cfg turbogate.cfg
+```
+
+2. **Start Turbogate**
+```bash
+./turbogate -c turbogate.cfg
+```
+
+3. **Test Connection**
+```bash
+curl http://localhost:8080
+```
+
+## 📝 Configuration
+
+### Basic Example
+```cfg
 global
     maxconn 8092
     daemon off
-    stats bind 0.0.0.0:9090
+    stats bind *:9090
+    
+    # Rate limiting
+    rate-limit-rps 100
+    rate-limit-burst 10
+    
+    # DDoS protection
+    ddos-protection reset-interval-seconds 60
+    ddos-protection max-requests-per-minute 100
+    ddos-protection max-connections-per-ip 10
+    ddos-protection suspicious-pattern bot, scanner
+    ddos-protection whitelist 192.168.1.1, 10.0.0.0/8
+    ddos-protection blacklist 172.30.1.1
 
 defaults
     mode tcp
     timeout connect 10s
     timeout client 120s
     timeout server 1h
-    timeout queue 15s
 
 frontend web_frontend
-    bind 0.0.0.0:8080
+    bind *:8080
     mode tcp
     default_backend web_backend
-    
-    # ACL for IP filtering
-    acl allowed_ip src 192.168.1.0/24
-    use_backend web_backend if allowed_ip
 
 backend web_backend
     mode tcp
-    balance leastconn
-    option clitcpka
-    retries 3
-    option tcp-check
-    tcp-check connect
-    
-    # Servers with health checks
-    server web1 10.0.1.10:80 check inter 5s fall 3 rise 2 weight 100
-    server web2 10.0.1.11:80 check inter 5s fall 3 rise 2 weight 100
-    server web3 10.0.1.12:80 check inter 5s fall 3 rise 2 weight 50
+    balance roundrobin
+    server server1 10.0.1.10:80 check inter 5s fall 3 rise 2
+    server server2 10.0.1.11:80 check inter 5s fall 3 rise 2
 ```
 
-### Running
+### Advanced Features
 
-```bash
-# Run with configuration file
-./target/release/turbogate -c config.cfg
-
-# Run with debug logging
-RUST_LOG=debug ./target/release/turbogate -c config.cfg
-
-# Run with custom log level
-RUST_LOG=turbogate=info ./target/release/turbogate -c config.cfg
+#### DDoS Protection
+```cfg
+# Global DDoS protection
+ddos-protection reset-interval-seconds 60
+ddos-protection max-requests-per-minute 100
+ddos-protection max-connections-per-ip 10
+ddos-protection suspicious-pattern bot, scanner, crawler
+ddos-protection whitelist 192.168.1.1, 10.0.0.0/8
+ddos-protection blacklist 172.30.1.1, 192.168.1.100
 ```
 
-## Configuration Reference
+#### Rate Limiting
+```cfg
+# Global rate limiting
+rate-limit-rps 100
+rate-limit-burst 10
+
+# Frontend-specific rate limiting
+frontend api_frontend
+    bind *:8081
+    rate-limit-rps 50
+    rate-limit-burst 5
+```
+
+#### Compression
+```cfg
+# Global compression settings
+compression-gzip enabled
+compression-brotli enabled
+compression-deflate disabled
+compression-min-size 1024
+compression-max-size 10485760
+compression-level 6
+```
+
+## 🔧 Configuration Options
 
 ### Global Section
-
-```haproxy
-global
-    maxconn 8092          # Maximum connections
-    daemon off            # Run in foreground
-    stats bind 0.0.0.0:9090  # Metrics endpoint
-```
+- `maxconn`: Maximum connections
+- `daemon`: Run in background
+- `stats bind`: Metrics endpoint
+- `rate-limit-rps`: Requests per second limit
+- `rate-limit-burst`: Burst size for rate limiting
+- `ddos-protection`: DDoS protection settings
 
 ### Frontend Section
-
-```haproxy
-frontend <name>
-    bind <ip:port>        # Listen address
-    mode tcp              # L4 mode
-    default_backend <name> # Default backend
-    
-    # ACL definitions
-    acl <name> src <ip/cidr>
-    use_backend <backend> if <condition>
-```
+- `bind`: Listen addresses (supports `*:port` syntax)
+- `mode`: Protocol mode (tcp/http)
+- `default_backend`: Default backend
+- `acl`: Access control lists
+- `use_backend`: Conditional backend routing
 
 ### Backend Section
+- `mode`: Protocol mode
+- `balance`: Load balancing algorithm
+- `server`: Backend servers
+- `option`: Backend options
+- `retries`: Retry attempts
 
-```haproxy
-backend <name>
-    mode tcp              # L4 mode
-    balance <algorithm>   # Balancing algorithm
-    option clitcpka       # Client TCP keep-alive
-    retries 3             # Connection retries
-    
-    # Health check options
-    option tcp-check
-    tcp-check connect
-    
-    # Server definitions
-    server <name> <ip:port> check inter <time> fall <n> rise <n> weight <n>
-```
+## 📊 Monitoring
 
-### Supported Balancing Algorithms
+### Metrics Endpoint
+Access metrics at `http://localhost:9090/metrics` (Prometheus format)
 
-- **`leastconn`** - Select server with least active connections
-- **`roundrobin`** - Round-robin selection
-- **`source`** - Hash based on source IP
-- **`random`** - Random selection
-- **`weighted_roundrobin`** - Weighted round-robin
+### Health Checks
+- TCP health checks with configurable intervals
+- Rise/fall thresholds
+- Automatic server failover
 
-### Health Check Parameters
+## 🔒 Security Features
 
-- **`check`** - Enable health checks
-- **`inter <time>`** - Check interval (e.g., `5s`, `30s`)
-- **`fall <n>`** - Mark server down after N consecutive failures
-- **`rise <n>`** - Mark server up after N consecutive successes
-- **`weight <n>`** - Server weight for weighted algorithms
+### DDoS Protection
+- IP-based connection limiting
+- Request rate limiting per IP
+- Suspicious pattern detection
+- Whitelist/blacklist support
+- Automatic counter reset
 
-## Metrics
+### Access Control
+- IP-based ACLs
+- CIDR notation support
+- Conditional routing
+- Block/allow rules
 
-Turbogate exposes Prometheus metrics on the configured stats endpoint (default: `0.0.0.0:9090`):
+## 🚀 Performance
 
-### Available Metrics
+- **High Throughput**: Optimized for high-performance environments
+- **Low Latency**: Minimal overhead for request processing
+- **Memory Efficient**: Rust's memory management ensures optimal resource usage
+- **Concurrent Connections**: Efficient handling of thousands of concurrent connections
 
-- `turbogate_requests_total` - Total requests processed
-- `turbogate_request_duration_seconds` - Request duration histogram
-- `turbogate_active_connections` - Active connections per server
-- `turbogate_server_status` - Server health status (0=down, 1=up)
-- `turbogate_backend_active_servers` - Number of active servers per backend
-- `turbogate_backend_total_servers` - Total servers per backend
-- `turbogate_health_check_total` - Health check results
-- `turbogate_server_status_changes_total` - Server status change events
+## 🔄 Hot Reload
 
-### Example Metrics Query
-
+Turbogate supports configuration hot reloading:
 ```bash
-# Get metrics
-curl http://localhost:9090/metrics
-
-# Example output
-# HELP turbogate_requests_total Total requests processed
-# TYPE turbogate_requests_total counter
-turbogate_requests_total{backend="web_backend",server="web1"} 150
+# Send SIGHUP to reload configuration
+kill -HUP <pid>
 ```
 
-## Logging
+## 📈 Use Cases
 
-Turbogate uses structured logging with the following log levels:
+- **Web Application Load Balancing**
+- **API Gateway**
+- **Microservices Proxy**
+- **DDoS Protection Layer**
+- **Content Delivery Optimization**
+- **High Availability Clusters**
 
-- **ERROR** - Critical errors and failures
-- **WARN** - Warning conditions
-- **INFO** - General information and status changes
-- **DEBUG** - Detailed debugging information
+## 💡 Key Advantages Summary
 
-### Log Events
+1. **Security**: Memory-safe by design, eliminating common vulnerabilities
+2. **Simplicity**: Easy configuration with modern syntax improvements
+3. **Performance**: High throughput with low latency
+4. **Reliability**: Built-in protection and monitoring
+5. **Modern**: Designed for today's distributed systems
+6. **Maintainable**: Clean codebase with comprehensive documentation
 
-- `request_start` - New request started
-- `request_end` - Request completed successfully
-- `request_error` - Request failed
-- `server_status_change` - Server health status changed
-- `backend_status` - Backend status update
-
-### Example Log Output
-
-```
-2025-07-06T12:39:40.470 INFO turbogate::logging: Request started request_id=abc123 client_ip=192.168.1.100 backend=web_backend server=web1 event="request_start"
-2025-07-06T12:39:40.473 INFO turbogate::logging: Request completed request_id=abc123 client_ip=192.168.1.100 backend=web_backend server=web1 status=success duration_ms=243 event="request_end"
-```
-
-## Performance
-
-Turbogate is designed for high-performance load balancing:
-
-- **Async I/O** - Non-blocking operations using Tokio
-- **Connection pooling** - Efficient connection management
-- **Memory efficient** - Low memory footprint
-- **Fast health checks** - Minimal overhead health monitoring
-- **Zero-copy proxying** - Efficient data transfer
-
-### Benchmarks
-
-- **Throughput**: 100,000+ requests/second on modern hardware
-- **Latency**: <1ms overhead per request
-- **Memory**: ~10MB base memory usage
-- **CPU**: Efficient single-threaded design with async I/O
-
-## Architecture
-
-### Core Components
-
-1. **Configuration Parser** - HAProxy-compatible config parsing
-2. **Health Checker** - Server health monitoring
-3. **Load Balancer** - Request distribution algorithms
-4. **Proxy** - TCP connection proxying
-5. **Metrics** - Prometheus metrics collection
-6. **Logging** - Structured logging system
-
-### Data Flow
-
-```
-Client Request → ACL Check → Health Check → Load Balancer → Server
-                ↓
-            Logging & Metrics
-```
-
-## Development
-
-### Building from Source
-
-```bash
-# Clone repository
-git clone https://github.com/Deplee/turbogate.git
-cd turbogate
-
-# Build debug version
-cargo build
-
-# Build release version
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run with specific log level
-RUST_LOG=debug cargo run -- -c test.cfg
-```
-
-### Project Structure
-
-```
-turbogate/
-├── src/
-│   ├── main.rs          # Application entry point
-│   ├── config.rs        # Configuration parsing
-│   ├── health.rs        # Health checking
-│   ├── balancer.rs      # Load balancing algorithms
-│   ├── proxy.rs         # TCP proxying
-│   ├── acl.rs           # Access control lists
-│   ├── metrics.rs       # Prometheus metrics
-│   ├── logging.rs       # Structured logging
-│   └── utils.rs         # Utility functions
-├── examples/            # Configuration examples
-├── Cargo.toml          # Rust dependencies
-└── README.md           # This file
-```
-
-## Contributing
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Add tests for new functionality
-5. Ensure all tests pass
-6. Submit a pull request
+4. Add tests
+5. Submit a pull request
 
-## License
+## 📄 License
 
-[LICENSE](LICENSE)
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Support
+## 🆘 Support
 
-For issues and questions:
-- Create an issue on GitHub
-- Check the documentation
-- Review the configuration examples
+- **Issues**: Report bugs and feature requests on GitHub
+- **Documentation**: See `examples/example.cfg` for comprehensive examples
+- **Community**: Join our community discussions
 
 ---
 
-**Turbogate** - High-performance L4 load balancing with HAProxy compatibility 
+**Turbogate** represents the next generation of load balancing technology, combining the reliability of proven concepts with the safety and performance of modern systems programming. It's not just an alternative to HAProxy—it's an evolution that addresses the challenges of modern infrastructure while maintaining compatibility with existing workflows.

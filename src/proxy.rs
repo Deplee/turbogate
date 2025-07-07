@@ -1,28 +1,27 @@
-use crate::config::{Config, FrontendConfig, BackendConfig, ServerConfig};
-use crate::logging::{RequestLogger, log_startup_info, log_shutdown_signal, log_graceful_shutdown};
+use crate::config::{FrontendConfig, BackendConfig, ServerConfig};
+use crate::logging::{RequestLogger, log_startup_info, log_graceful_shutdown};
 use crate::metrics;
 use crate::health::{HealthChecker, ServerStatus};
-use crate::acl::{AclManager, Acl, RequestData};
-use crate::balancer::{BackendLoadBalancer, ServerState};
-use crate::utils;
-use crate::options::Options;
+use crate::balancer::BackendLoadBalancer;
+use crate::acl::Acl;
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::net::{SocketAddr, IpAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::task;
 use tracing::{info, warn, error, debug};
+use crate::features::FeaturesManager;
 
 pub struct ProxyServer {
-    config: Config,
     frontends: Arc<DashMap<String, FrontendState>>,
     backends: Arc<DashMap<String, BackendState>>,
     health_checkers: Arc<DashMap<String, HealthChecker>>,
     active_connections: Arc<RwLock<HashMap<String, u64>>>,
     server_statuses: Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
+    features_manager: Arc<FeaturesManager>,
 }
 
 struct FrontendState {
@@ -36,57 +35,74 @@ struct BackendState {
 }
 
 impl ProxyServer {
-    pub fn new(config: Config) -> Self {
+    pub fn new(features_manager: Arc<FeaturesManager>) -> Self {
         Self {
             frontends: Arc::new(DashMap::new()),
             backends: Arc::new(DashMap::new()),
             health_checkers: Arc::new(DashMap::new()),
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             server_statuses: Arc::new(RwLock::new(HashMap::new())),
-            config,
+            features_manager,
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Инициализируем frontend'ы и backend'ы
         self.initialize_frontends().await?;
         self.initialize_backends().await?;
         
-        // Запускаем health checkers
         self.start_health_checkers().await;
 
-        // Логируем информацию о запуске
-        let bind_addresses: Vec<String> = self.config.frontends.iter()
+        let bind_addresses: Vec<String> = self.features_manager.config.frontends.iter()
             .flat_map(|f| f.bind.clone())
             .collect();
         log_startup_info("0.1.0", "turbogate.toml", bind_addresses);
 
-        // Запускаем обработку сигналов завершения
-        let shutdown_signal = Self::setup_shutdown_signal();
+        let mut shutdown_signal = Self::setup_shutdown_signal();
 
-        // Запускаем все frontend'ы
+        let ddos_reset_task = {
+            let features_manager = Arc::clone(&self.features_manager);
+            task::spawn(async move {
+                loop {
+                    let interval = {
+                        if let Some(ddos) = &features_manager.ddos_protection {
+                            let val = ddos.reset_interval_seconds();
+                            if val < 1 { 60 } else { val }
+                        } else {
+                            60
+                        }
+                    };
+                    info!("DDoS: ожидаю {} секунд до следующего сброса счетчиков", interval);
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    if let Some(ddos) = &features_manager.ddos_protection {
+                        ddos.reset_counters();
+                        info!("DDoS: счетчики сброшены (reset_counters)");
+                    }
+                }
+            })
+        };
+
         let mut frontend_tasks = Vec::new();
         for frontend_name in self.frontends.iter().map(|f| f.key().clone()) {
             let frontends = Arc::clone(&self.frontends);
             let backends = Arc::clone(&self.backends);
             let active_connections = Arc::clone(&self.active_connections);
-            let config = Arc::new(self.config.clone());
             let server_statuses = Arc::clone(&self.server_statuses);
+            let features_manager = Arc::clone(&self.features_manager);
             
             let task = task::spawn(async move {
-                Self::run_frontend(frontend_name, frontends, backends, active_connections, config, server_statuses).await;
+                if let Err(e) = Self::run_frontend(frontend_name, frontends, backends, active_connections, server_statuses, features_manager).await {
+                    error!("Error running frontend: {}", e);
+                }
             });
             frontend_tasks.push(task);
         }
 
-        // Ждем сигнала завершения
-        shutdown_signal.await;
+        shutdown_signal.recv().await;
         
-        // Graceful shutdown
         let active_conns = self.active_connections.read().await.values().sum();
         log_graceful_shutdown(active_conns);
         
-        // Отменяем все задачи
+        ddos_reset_task.abort();
         for task in frontend_tasks {
             task.abort();
         }
@@ -96,7 +112,7 @@ impl ProxyServer {
     }
 
     async fn initialize_frontends(&mut self) -> Result<()> {
-        for frontend_config in &self.config.frontends {
+        for frontend_config in &self.features_manager.config.frontends {
             let mut listeners = Vec::new();
             
             for bind_addr in &frontend_config.bind {
@@ -118,7 +134,7 @@ impl ProxyServer {
     }
 
     async fn initialize_backends(&mut self) -> Result<()> {
-        for backend_config in &self.config.backends {
+        for backend_config in &self.features_manager.config.backends {
             let algorithm = backend_config.balance.as_deref().unwrap_or("roundrobin");
             let load_balancer = BackendLoadBalancer::new(backend_config.server.clone(), algorithm)?;
             
@@ -128,26 +144,21 @@ impl ProxyServer {
             };
 
             self.backends.insert(backend_config.name.clone(), backend_state);
-            info!("Backend '{}' initialized with {} servers using {} algorithm", 
-                  backend_config.name, backend_config.server.len(), algorithm);
         }
 
         Ok(())
     }
 
     async fn start_health_checkers(&self) {
-        let server_statuses = Arc::clone(&self.server_statuses);
-        
-        for backend_config in &self.config.backends {
-            let health_checker = HealthChecker::new(backend_config.clone());
-            let backend_name = backend_config.name.clone();
-            
-            // Запускаем health checker с callback для обновления статусов
-            let server_statuses_clone = Arc::clone(&server_statuses);
-            health_checker.start_with_callback(backend_name.clone(), server_statuses_clone).await;
-            
-            self.health_checkers.insert(backend_config.name.clone(), health_checker);
-            info!("Health checker started for backend '{}'", backend_config.name);
+        for backend_config in &self.features_manager.config.backends {
+            if backend_config.health_check.is_some() {
+                let health_checker = HealthChecker::new(backend_config.clone());
+                self.health_checkers.insert(backend_config.name.clone(), health_checker);
+            }
+        }
+
+        for health_checker in self.health_checkers.iter() {
+            health_checker.value().start().await;
         }
     }
 
@@ -156,36 +167,36 @@ impl ProxyServer {
         frontends: Arc<DashMap<String, FrontendState>>,
         backends: Arc<DashMap<String, BackendState>>,
         active_connections: Arc<RwLock<HashMap<String, u64>>>,
-        config: Arc<Config>,
         server_statuses: Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
-    ) {
+        features_manager: Arc<FeaturesManager>,
+    ) -> Result<()> {
         if let Some(frontend_state) = frontends.get(&frontend_name) {
-            let listeners = frontend_state.listeners.clone();
-            drop(frontend_state); // Освобождаем borrow
-            
-            for listener in listeners {
+            for listener in &frontend_state.listeners {
+                let listener = Arc::clone(listener);
                 let frontend_name = frontend_name.clone();
                 let frontends = Arc::clone(&frontends);
                 let backends = Arc::clone(&backends);
                 let active_connections = Arc::clone(&active_connections);
-                let config = Arc::clone(&config);
                 let server_statuses = Arc::clone(&server_statuses);
-
+                let features_manager = Arc::clone(&features_manager);
+                
                 task::spawn(async move {
                     if let Err(e) = Self::accept_connections(
-                        listener.as_ref(),
+                        &listener,
                         &frontend_name,
                         frontends,
                         backends,
                         active_connections,
-                        config,
                         server_statuses,
+                        features_manager,
                     ).await {
-                        error!("Error accepting connections for frontend {}: {}", frontend_name, e);
+                        error!("Error accepting connections on frontend {}: {}", frontend_name, e);
                     }
                 });
             }
         }
+
+        Ok(())
     }
 
     async fn accept_connections(
@@ -194,14 +205,13 @@ impl ProxyServer {
         frontends: Arc<DashMap<String, FrontendState>>,
         backends: Arc<DashMap<String, BackendState>>,
         active_connections: Arc<RwLock<HashMap<String, u64>>>,
-        config: Arc<Config>,
         server_statuses: Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
+        features_manager: Arc<FeaturesManager>,
     ) -> Result<()> {
         loop {
             let (client_stream, client_addr) = listener.accept().await?;
             
-            // Проверяем лимит maxconn
-            let max_connections = config.global.maxconn.unwrap_or(4096);
+            let max_connections = features_manager.config.global.maxconn.unwrap_or(4096);
             let current_connections = {
                 let conns = active_connections.read().await;
                 conns.values().sum::<u64>()
@@ -210,39 +220,46 @@ impl ProxyServer {
             if current_connections >= max_connections as u64 {
                 warn!("Max connections limit reached: {} >= {}", current_connections, max_connections);
                 metrics::connection_error(frontend_name, "maxconn_limit");
-                continue; // Отклоняем новое соединение
+                continue;
             }
             
-            // Обновляем счетчик активных соединений
             {
                 let mut conns = active_connections.write().await;
                 *conns.entry(frontend_name.to_string()).or_insert(0) += 1;
             }
 
-            metrics::connection_accepted(frontend_name);
-            
             let frontend_name = frontend_name.to_string();
             let frontends = Arc::clone(&frontends);
             let backends = Arc::clone(&backends);
             let active_connections = Arc::clone(&active_connections);
-            let config = Arc::clone(&config);
             let server_statuses = Arc::clone(&server_statuses);
+            let features_manager = Arc::clone(&features_manager);
+            
+            let handle_timeout = std::time::Duration::from_secs(30);
 
             task::spawn(async move {
-                if let Err(e) = Self::handle_connection(
+                match tokio::time::timeout(handle_timeout, Self::handle_connection(
                     client_stream,
                     client_addr,
                     &frontend_name,
                     frontends,
                     backends,
-                    config,
                     server_statuses,
-                ).await {
-                    error!("Error handling connection from {}: {}", client_addr, e);
-                    metrics::connection_error(&frontend_name, "handle_error");
+                    features_manager,
+                )).await {
+                    Ok(Ok(())) => {
+                        debug!("Connection from {} handled successfully", client_addr);
+                    }
+                    Ok(Err(e)) => {
+                        error!("Error handling connection from {}: {}", client_addr, e);
+                        metrics::connection_error(&frontend_name, "handle_error");
+                    }
+                    Err(_) => {
+                        error!("Connection from {} timed out after {:?}", client_addr, handle_timeout);
+                        metrics::connection_error(&frontend_name, "handle_timeout");
+                    }
                 }
 
-                // Уменьшаем счетчик активных соединений
                 {
                     let mut conns = active_connections.write().await;
                     if let Some(count) = conns.get_mut(&frontend_name) {
@@ -261,36 +278,41 @@ impl ProxyServer {
         frontend_name: &str,
         frontends: Arc<DashMap<String, FrontendState>>,
         backends: Arc<DashMap<String, BackendState>>,
-        config: Arc<Config>,
         server_statuses: Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
+        features_manager: Arc<FeaturesManager>,
     ) -> Result<()> {
-        // Получаем конфигурацию frontend'а
+        if let Some(rate_limiter) = &features_manager.rate_limiter {
+            if !rate_limiter.check_rate_limit(client_addr.ip()) {
+                warn!("Rate limit exceeded for client {} on frontend {}", client_addr.ip(), frontend_name);
+                metrics::connection_error(frontend_name, "rate_limit_exceeded");
+                return Err(anyhow!("Rate limit exceeded"));
+            }
+        }
+
+        if let Some(ddos_protection) = &features_manager.ddos_protection {
+            if !ddos_protection.check_connection_limit(client_addr.ip()) {
+                warn!("DDoS protection: connection limit exceeded for client {} on frontend {}", client_addr.ip(), frontend_name);
+                metrics::connection_error(frontend_name, "ddos_connection_limit");
+                return Err(anyhow!("DDoS protection: connection limit exceeded"));
+            }
+        }
+
         let frontend_config = if let Some(frontend_state) = frontends.get(frontend_name) {
             frontend_state.config.clone()
         } else {
             return Err(anyhow!("Frontend '{}' not found", frontend_name));
         };
 
-        // Определяем backend
         let backend_name = Self::select_backend(&frontend_config, client_addr)?;
         
-        // Получаем конфигурацию backend'а
         let mut backend_state = if let Some(backend) = backends.get_mut(&backend_name) {
             backend
         } else {
             return Err(anyhow!("Backend '{}' not found", backend_name));
         };
 
-        // Клонируем конфигурацию до mutable borrow
-        let backend_config = backend_state.config.clone();
-        
-        // Получаем количество retries из конфигурации backend
-        let max_retries = backend_config.retries.unwrap_or(3);
-        
-        // Выбираем сервер с обновлением статусов из health checker
         let server = Self::select_server(&mut backend_state, &server_statuses).await?;
         
-        // Создаем логгер для запроса и начинаем измерение времени
         let start_time = std::time::Instant::now();
         let logger = RequestLogger::new(
             client_addr.ip().to_string(),
@@ -301,263 +323,127 @@ impl ProxyServer {
         logger.log_request_start();
         metrics::request_started(&backend_name, &server.name);
 
-        // Получаем timeout'ы из конфигурации
-        let connect_timeout = backend_config.options
-            .as_ref()
-            .map(|opts| opts.get_connect_timeout())
-            .unwrap_or_else(|| std::time::Duration::from_secs(5));
+        if let Some(ddos_protection) = &features_manager.ddos_protection {
+            if !ddos_protection.check_rate_limit(client_addr.ip()) {
+                warn!("DDoS protection: rate limit exceeded for client {} on frontend {}", client_addr.ip(), frontend_name);
+                metrics::connection_error(frontend_name, "ddos_rate_limit");
+                return Err(anyhow!("DDoS protection: rate limit exceeded"));
+            }
+        }
 
-        // Устанавливаем соединение с сервером с retries
-        let connection_start = std::time::Instant::now();
-        let server_addr = format!("{}:{}", server.address, server.port);
-        
-        let mut last_error = None;
-        let mut server_stream = None;
-        
-        for attempt in 0..=max_retries {
-            match tokio::time::timeout(connect_timeout, TcpStream::connect(&server_addr)).await {
-                Ok(Ok(stream)) => {
-                    server_stream = Some(stream);
-                    if attempt > 0 {
-                        debug!("Successfully connected to server {} after {} retries", server.name, attempt);
-                    }
-                    break;
+        match Self::proxy_connection(client_stream, &server).await {
+            Ok(()) => {
+                let duration = start_time.elapsed();
+                logger.log_request_end("success", 0);
+                metrics::request_completed(&backend_name, &server.name, "success", duration.as_millis() as u64);
+                
+                if let Some(ddos_protection) = &features_manager.ddos_protection {
+                    ddos_protection.connection_closed(client_addr.ip());
                 }
-                Ok(Err(e)) => {
-                    let error_msg = e.to_string();
-                    last_error = Some(e);
-                    if attempt < max_retries {
-                        warn!("Failed to connect to server {} (attempt {}/{}): {}", server.name, attempt + 1, max_retries + 1, error_msg);
-                        // Небольшая задержка перед повторной попыткой
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
+                
+                Ok(())
+            }
+            Err(e) => {
+                logger.log_request_end("failure", 0);
+                metrics::request_failed(&backend_name, &server.name, "connection_failed");
+                
+                if let Some(ddos_protection) = &features_manager.ddos_protection {
+                    ddos_protection.connection_closed(client_addr.ip());
                 }
-                Err(_) => {
-                    last_error = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timeout"));
-                    if attempt < max_retries {
-                        warn!("Connection timeout to server {} (attempt {}/{}): {:?}", server.name, attempt + 1, max_retries + 1, connect_timeout);
-                        // Небольшая задержка перед повторной попыткой
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
+                
+                Err(e)
+            }
+        }
+    }
+
+    fn select_backend(frontend_config: &FrontendConfig, client_addr: SocketAddr) -> Result<String> {
+        if let Some(ref backend_name) = frontend_config.default_backend {
+            return Ok(backend_name.clone());
+        }
+
+        for use_backend in &frontend_config.use_backend {
+            if let Some(ref condition) = use_backend.condition {
+                if Self::evaluate_acl_condition(condition, client_addr)? {
+                    return Ok(use_backend.backend.clone());
                 }
             }
         }
-        
-        let server_stream = match server_stream {
-            Some(stream) => stream,
-            None => {
-                let duration = start_time.elapsed();
-                let connection_time = connection_start.elapsed();
-                let error_msg = format!("Failed to connect to server after {} retries: {}", max_retries + 1, 
-                                       last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string()));
-                logger.log_error(&error_msg);
-                metrics::request_failed(&backend_name, &server.name, "connection_failed");
-                metrics::request_completed(&backend_name, &server.name, "connection_failed", duration.as_millis() as u64);
-                metrics::record_detailed_timing_metrics(&backend_name, &server.name, duration.as_millis() as u64, Some(connection_time.as_millis() as u64), None);
-                return Err(anyhow!(error_msg));
-            }
-        };
-        let connection_time = connection_start.elapsed();
 
-        // Проксируем данные с timeout'ами
-        let transfer_start = std::time::Instant::now();
-        let proxy_result = Self::proxy_data_with_timeouts(
-            client_stream, 
-            server_stream, 
-            &backend_config
-        ).await;
-        let transfer_time = transfer_start.elapsed();
-        let duration = start_time.elapsed();
+        Err(anyhow!("No backend selected for frontend"))
+    }
+
+    async fn select_server(
+        backend_state: &mut BackendState,
+        server_statuses: &Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
+    ) -> Result<ServerConfig> {
+        let statuses = server_statuses.read().await;
+        let backend_statuses = statuses.get(&backend_state.config.name);
         
-        match proxy_result {
-            Ok((bytes_client_to_server, bytes_server_to_client)) => {
-                logger.log_request_end("success", bytes_client_to_server + bytes_server_to_client);
-                metrics::request_completed(&backend_name, &server.name, "success", duration.as_millis() as u64);
-                metrics::record_detailed_timing_metrics(
-                    &backend_name, 
-                    &server.name, 
-                    duration.as_millis() as u64,
-                    Some(connection_time.as_millis() as u64),
-                    Some(transfer_time.as_millis() as u64)
-                );
-                metrics::bytes_transferred(frontend_name, "client_to_server", bytes_client_to_server);
-                metrics::bytes_transferred(frontend_name, "server_to_client", bytes_server_to_client);
+        let available_servers: Vec<&ServerConfig> = backend_state.config.server.iter()
+            .filter(|server| {
+                if server.disabled.unwrap_or(false) {
+                    return false;
+                }
+                
+                if let Some(ref statuses) = backend_statuses {
+                    if let Some(status) = statuses.get(&server.name) {
+                        return status == &ServerStatus::Up;
+                    }
+                }
+                
+                true
+            })
+            .collect();
+
+        if available_servers.is_empty() {
+            return Err(anyhow!("No healthy servers available"));
+        }
+
+        let selected_server = backend_state.load_balancer.select_server()?;
+        if let Some(server_state) = selected_server {
+            Ok(server_state.config.clone())
+        } else {
+            Err(anyhow!("No server selected by load balancer"))
+        }
+    }
+
+    async fn proxy_connection(client_stream: TcpStream, server: &ServerConfig) -> Result<()> {
+        let server_addr = format!("{}:{}", server.address, server.port);
+        let server_stream = TcpStream::connect(&server_addr).await?;
+
+        let (mut client_read, mut client_write) = client_stream.into_split();
+        let (mut server_read, mut server_write) = server_stream.into_split();
+
+        let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
+        let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
+
+        tokio::select! {
+            result = client_to_server => {
+                if let Err(e) = result {
+                    return Err(anyhow!("Client to server error: {}", e));
+                }
             }
-            Err(e) => {
-                logger.log_error(&format!("Proxy error: {}", e));
-                metrics::request_failed(&backend_name, &server.name, "proxy_error");
-                metrics::request_completed(&backend_name, &server.name, "proxy_error", duration.as_millis() as u64);
-                metrics::record_detailed_timing_metrics(
-                    &backend_name, 
-                    &server.name, 
-                    duration.as_millis() as u64,
-                    Some(connection_time.as_millis() as u64),
-                    Some(transfer_time.as_millis() as u64)
-                );
-                return Err(e);
+            result = server_to_client => {
+                if let Err(e) = result {
+                    return Err(anyhow!("Server to client error: {}", e));
+                }
             }
         }
 
         Ok(())
     }
 
-    fn select_backend(frontend_config: &FrontendConfig, client_addr: SocketAddr) -> Result<String> {
-        // Проверяем ACL'ы
-        for acl in &frontend_config.acl {
-            if !Self::evaluate_acl(acl, client_addr)? {
-                return Err(anyhow!("Access denied by ACL '{}'", acl.name));
-            }
-        }
-
-        // Проверяем use_backend правила
-        for use_backend in &frontend_config.use_backend {
-            if let Some(condition) = &use_backend.condition {
-                if Self::evaluate_condition(condition, client_addr)? {
-                    return Ok(use_backend.backend.clone());
-                }
-            }
-        }
-
-        // Используем default_backend
-        if let Some(ref backend_name) = frontend_config.default_backend {
-            Ok(backend_name.clone())
-        } else {
-            Err(anyhow!("No backend selected for frontend '{}'", frontend_config.name))
-        }
+    fn evaluate_acl_condition(condition: &str, client_addr: SocketAddr) -> Result<bool> {
+        let acl_config = crate::config::AclConfig {
+            name: "temp".to_string(),
+            criterion: condition.to_string(),
+        };
+        let acl = Acl::from_config(&acl_config)?;
+        acl.evaluate(client_addr)
     }
 
-    async fn select_server<'a>(
-        backend_state: &'a mut BackendState,
-        server_statuses: &'a Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
-    ) -> Result<&'a ServerConfig> {
-        // Обновляем статусы серверов из health checker перед выбором
-        Self::update_server_statuses_from_health_checker(backend_state, server_statuses).await;
-        
-        if let Some(server_state) = backend_state.load_balancer.select_server()? {
-            Ok(&server_state.config)
-        } else {
-            Err(anyhow!("No available servers in backend"))
-        }
-    }
-
-    async fn update_server_statuses_from_health_checker(
-        backend_state: &mut BackendState,
-        server_statuses: &Arc<RwLock<HashMap<String, HashMap<String, ServerStatus>>>>,
-    ) {
-        let backend_name = &backend_state.config.name;
-        debug!("=== Updating server statuses for backend '{}' ===", backend_name);
-        
-        // Получаем статусы серверов из shared state
-        let statuses = server_statuses.read().await;
-        debug!("Total backends in shared state: {}", statuses.len());
-        
-        if let Some(backend_statuses) = statuses.get(backend_name) {
-            debug!("Found {} server statuses for backend '{}'", backend_statuses.len(), backend_name);
-            
-            // Обновляем статусы в балансировщике
-            for (server_name, status) in backend_statuses {
-                let old_status = backend_state.load_balancer.get_server_status(server_name);
-                backend_state.load_balancer.update_server_status(server_name, status.clone());
-                if old_status != Some(status.clone()) {
-                    info!("Updated server {} status from {:?} to {:?} in backend {}", 
-                          server_name, old_status, status, backend_name);
-                } else {
-                    debug!("Updated server {} status to {:?} in backend {}", server_name, status, backend_name);
-                }
-            }
-            
-            debug!("Successfully updated {} server statuses in load balancer", backend_statuses.len());
-        } else {
-            debug!("No server statuses found for backend '{}'", backend_name);
-            debug!("Available backends in shared state: {:?}", statuses.keys().collect::<Vec<_>>());
-        }
-        
-        debug!("=== Completed updating server statuses for backend '{}' ===", backend_name);
-    }
-
-    fn evaluate_acl(acl: &crate::config::AclConfig, client_addr: SocketAddr) -> Result<bool> {
-        let acl_instance = Acl::from_config(acl)?;
-        acl_instance.evaluate(client_addr, None)
-    }
-
-    fn evaluate_condition(condition: &str, _client_addr: SocketAddr) -> Result<bool> {
-        // В L4 режиме большинство условий не применимы
-        // Простая реализация - разрешаем все
-        debug!("Condition evaluation in L4 mode: {}", condition);
-        Ok(true)
-    }
-
-    async fn proxy_data_with_timeouts(
-        mut client_stream: TcpStream,
-        mut server_stream: TcpStream,
-        config: &BackendConfig,
-    ) -> Result<(u64, u64)> {
-        // Получаем timeout'ы из конфигурации
-        let client_timeout = config.options
-            .as_ref()
-            .map(|opts| opts.get_client_timeout())
-            .unwrap_or_else(|| std::time::Duration::from_secs(50));
-        
-        let server_timeout = config.options
-            .as_ref()
-            .map(|opts| opts.get_server_timeout())
-            .unwrap_or_else(|| std::time::Duration::from_secs(50));
-
-        let (mut client_read, mut client_write) = client_stream.split();
-        let (mut server_read, mut server_write) = server_stream.split();
-        
-        // Проксируем данные с timeout'ами
-        let client_to_server = tokio::time::timeout(
-            client_timeout,
-            tokio::io::copy(&mut client_read, &mut server_write)
-        );
-        let server_to_client = tokio::time::timeout(
-            server_timeout,
-            tokio::io::copy(&mut server_read, &mut client_write)
-        );
-        
-        match tokio::try_join!(client_to_server, server_to_client) {
-            Ok((Ok(bytes_client_to_server), Ok(bytes_server_to_client))) => {
-                Ok((bytes_client_to_server, bytes_server_to_client))
-            }
-            Ok((Err(e), _)) => {
-                Err(anyhow!("Client to server transfer failed: {}", e))
-            }
-            Ok((_, Err(e))) => {
-                Err(anyhow!("Server to client transfer failed: {}", e))
-            }
-            Err(_) => {
-                Err(anyhow!("Transfer timeout"))
-            }
-        }
-    }
-
-    async fn proxy_data(
-        mut client_stream: TcpStream,
-        mut server_stream: TcpStream,
-    ) -> Result<(u64, u64)> {
-        let (mut client_read, mut client_write) = client_stream.split();
-        let (mut server_read, mut server_write) = server_stream.split();
-        
-        let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
-        let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
-        
-        let (bytes_client_to_server, bytes_server_to_client) = tokio::try_join!(client_to_server, server_to_client)?;
-        
-        Ok((bytes_client_to_server, bytes_server_to_client))
-    }
-
-    async fn setup_shutdown_signal() {
-        use tokio::signal;
+    fn setup_shutdown_signal() -> tokio::signal::unix::Signal {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                log_shutdown_signal("SIGINT");
-            }
-            _ = term.recv() => {
-                log_shutdown_signal("SIGTERM");
-            }
-        }
+        signal(SignalKind::terminate()).expect("Failed to create signal handler")
     }
 }

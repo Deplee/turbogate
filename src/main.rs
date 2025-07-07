@@ -1,6 +1,6 @@
 use clap::Parser;
 use tracing::{info, error, Level};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::sync::Arc;
 
 mod config;
 mod proxy;
@@ -11,27 +11,29 @@ mod utils;
 mod acl;
 mod balancer;
 mod options;
+mod rate_limit;
+mod ddos_protection;
+mod hot_reload;
+mod compression;
+mod features;
 
 use config::Config;
 use proxy::ProxyServer;
+use features::FeaturesManager;
 
 #[derive(Parser)]
 #[command(name = "turbogate")]
 #[command(about = "High-performance L4 load balancer compatible with HAProxy")]
 struct Cli {
-    /// Path to configuration file
     #[arg(short, long, default_value = "turbogate.cfg")]
     config: String,
 
-    /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: Level,
 
-    /// Enable JSON logging
     #[arg(long)]
     json_logs: bool,
 
-    /// Validate configuration and exit
     #[arg(long)]
     check: bool,
 }
@@ -40,14 +42,12 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Инициализация логирования
     logging::init(cli.log_level, cli.json_logs)?;
 
     info!("Starting Turbogate L4 Load Balancer");
     info!("Log level: {}", cli.log_level);
     info!("Configuration file: {}", cli.config);
 
-    // Загрузка конфигурации
     let config = match Config::from_file(&cli.config).await {
         Ok(config) => {
             info!("Configuration loaded successfully");
@@ -59,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Валидация конфигурации
     if let Err(e) = config.validate() {
         error!("Configuration validation failed: {}", e);
         return Err(e.into());
@@ -70,13 +69,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Инициализация метрик
     metrics::init(&config.metrics).await?;
 
-    // Запуск прокси сервера
-    let mut proxy = ProxyServer::new(config);
+    let config_arc = Arc::new(config);
+    let features_manager = FeaturesManager::new(config_arc.clone())?;
     
-    info!("Starting proxy server...");
+    let mut proxy = ProxyServer::new(Arc::new(features_manager));
+    
+    info!("Starting proxy server with enhanced features...");
     if let Err(e) = proxy.run().await {
         error!("Proxy server failed: {}", e);
         return Err(e);

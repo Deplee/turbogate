@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ pub struct Options {
 pub struct HttpOptions {
     pub httpchk: Option<HttpCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub http_keep_alive_timeout: Option<u64>, // Duration в миллисекундах
+    pub http_keep_alive_timeout: Option<u64>,
     pub dontlognull: bool,
     pub logasap: bool,
 }
@@ -30,13 +30,13 @@ pub struct TcpOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_connect: Option<u64>, // Duration в миллисекундах
+    pub timeout_connect: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_client: Option<u64>, // Duration в миллисекундах
+    pub timeout_client: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_server: Option<u64>, // Duration в миллисекундах
+    pub timeout_server: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_queue: Option<u64>, // Duration в миллисекундах
+    pub timeout_queue: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,10 +81,10 @@ impl Default for TcpOptions {
 impl Default for GeneralOptions {
     fn default() -> Self {
         Self {
-            timeout_connect: Some(5000), // 5 секунд в миллисекундах
-            timeout_client: Some(50000), // 50 секунд в миллисекундах
-            timeout_server: Some(50000), // 50 секунд в миллисекундах
-            timeout_queue: Some(10000), // 10 секунд в миллисекундах
+            timeout_connect: Some(5000),
+            timeout_client: Some(50000),
+            timeout_server: Some(50000),
+            timeout_queue: Some(10000),
         }
     }
 }
@@ -125,7 +125,6 @@ impl Options {
             }
             "tcp-check" => {
                 opts.tcp_options.tcp_check = true;
-                // Проверяем, есть ли дополнительные параметры
                 if parts.len() > 1 && parts[1] == "connect" {
                     opts.tcp_options.tcp_check_connect = true;
                 }
@@ -139,7 +138,6 @@ impl Options {
     }
     
     fn parse_httpchk(option: &str) -> Result<HttpCheck> {
-        // Парсим "httpchk GET /ping" или "httpchk"
         let parts: Vec<&str> = option.split_whitespace().collect();
         
         if parts.len() >= 3 {
@@ -171,7 +169,6 @@ impl Options {
             let hours: u64 = timeout_str[..timeout_str.len()-1].parse()?;
             Ok(std::time::Duration::from_secs(hours * 3600))
         } else {
-            // Попробуем как секунды
             let secs: u64 = timeout_str.parse()?;
             Ok(std::time::Duration::from_secs(secs))
         }
@@ -191,30 +188,5 @@ impl Options {
         }
         
         Ok(())
-    }
-    
-    // Методы для получения timeout'ов
-    pub fn get_connect_timeout(&self) -> std::time::Duration {
-        self.general_options.timeout_connect
-            .map(|ms| std::time::Duration::from_millis(ms))
-            .unwrap_or(std::time::Duration::from_secs(5))
-    }
-    
-    pub fn get_client_timeout(&self) -> std::time::Duration {
-        self.general_options.timeout_client
-            .map(|ms| std::time::Duration::from_millis(ms))
-            .unwrap_or(std::time::Duration::from_secs(50))
-    }
-    
-    pub fn get_server_timeout(&self) -> std::time::Duration {
-        self.general_options.timeout_server
-            .map(|ms| std::time::Duration::from_millis(ms))
-            .unwrap_or(std::time::Duration::from_secs(50))
-    }
-    
-    pub fn get_queue_timeout(&self) -> std::time::Duration {
-        self.general_options.timeout_queue
-            .map(|ms| std::time::Duration::from_millis(ms))
-            .unwrap_or(std::time::Duration::from_secs(10))
     }
 }
