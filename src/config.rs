@@ -625,4 +625,4 @@ impl Default for MetricsConfig {
             path: Some("/metrics".to_string()),
         }
     }
-} 
+}

@@ -425,4 +425,4 @@ impl BackendLoadBalancer {
     pub fn algorithm(&self) -> &str {
         &self.algorithm
     }
-} 
+}

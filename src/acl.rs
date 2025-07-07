@@ -232,4 +232,4 @@ pub fn validate_acl_config(acls: &[AclConfig]) -> Result<()> {
         let _ = Acl::from_config(acl)?;
     }
     Ok(())
-} 
+}

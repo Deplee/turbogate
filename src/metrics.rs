@@ -235,4 +235,4 @@ pub fn record_detailed_timing_metrics(
     counter!("turbogate_requests_per_second", 1, 
              "backend" => backend.to_string(), 
              "server" => server.to_string());
-} 
+}

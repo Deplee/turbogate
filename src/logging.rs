@@ -274,4 +274,4 @@ pub fn log_graceful_shutdown(active_connections: u64) {
         event = "graceful_shutdown",
         "Starting graceful shutdown"
     );
-} 
+}
