@@ -61,6 +61,7 @@ pub struct BackendConfig {
     pub timeout: HashMap<String, String>,
     pub health_check: Option<HealthCheckConfig>,
     pub options: Option<Options>,
+    pub retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +189,7 @@ impl Config {
                                 timeout: HashMap::new(),
                                 health_check: None,
                                 options: None,
+                                retries: None,
                             });
                         },
                         _ => {
@@ -529,6 +531,7 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
         },
         "option" => backend.option.push(value.to_string()),
         "tcp-check" => backend.option.push(value.to_string()),
+        "retries" => backend.retries = Some(value.parse()?),
         "timeout" => {
             let parts: Vec<&str> = value.split_whitespace().collect();
             if parts.len() >= 2 {
@@ -554,7 +557,7 @@ fn parse_backend_directive(backend: &mut BackendConfig, key: &str, value: &str) 
 // Создаем HealthCheckConfig из параметров серверов
 fn create_health_check_config(backend: &BackendConfig) -> Option<HealthCheckConfig> {
     let mut interval = "2s".to_string();
-    let mut timeout = "1s".to_string();
+    let timeout = "1s".to_string();
     let mut rise = 2;
     let mut fall = 3;
     

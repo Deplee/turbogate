@@ -284,6 +284,9 @@ impl ProxyServer {
         // Клонируем конфигурацию до mutable borrow
         let backend_config = backend_state.config.clone();
         
+        // Получаем количество retries из конфигурации backend
+        let max_retries = backend_config.retries.unwrap_or(3);
+        
         // Выбираем сервер с обновлением статусов из health checker
         let server = Self::select_server(&mut backend_state, &server_statuses).await?;
         
@@ -304,28 +307,54 @@ impl ProxyServer {
             .map(|opts| opts.get_connect_timeout())
             .unwrap_or_else(|| std::time::Duration::from_secs(5));
 
-        // Устанавливаем соединение с сервером с timeout
+        // Устанавливаем соединение с сервером с retries
         let connection_start = std::time::Instant::now();
         let server_addr = format!("{}:{}", server.address, server.port);
-        let server_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(&server_addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
+        
+        let mut last_error = None;
+        let mut server_stream = None;
+        
+        for attempt in 0..=max_retries {
+            match tokio::time::timeout(connect_timeout, TcpStream::connect(&server_addr)).await {
+                Ok(Ok(stream)) => {
+                    server_stream = Some(stream);
+                    if attempt > 0 {
+                        debug!("Successfully connected to server {} after {} retries", server.name, attempt);
+                    }
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let error_msg = e.to_string();
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        warn!("Failed to connect to server {} (attempt {}/{}): {}", server.name, attempt + 1, max_retries + 1, error_msg);
+                        // Небольшая задержка перед повторной попыткой
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                Err(_) => {
+                    last_error = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timeout"));
+                    if attempt < max_retries {
+                        warn!("Connection timeout to server {} (attempt {}/{}): {:?}", server.name, attempt + 1, max_retries + 1, connect_timeout);
+                        // Небольшая задержка перед повторной попыткой
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+        
+        let server_stream = match server_stream {
+            Some(stream) => stream,
+            None => {
                 let duration = start_time.elapsed();
                 let connection_time = connection_start.elapsed();
-                logger.log_error(&format!("Failed to connect to server: {}", e));
+                let error_msg = format!("Failed to connect to server after {} retries: {}", max_retries + 1, 
+                                       last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string()));
+                logger.log_error(&error_msg);
                 metrics::request_failed(&backend_name, &server.name, "connection_failed");
                 metrics::request_completed(&backend_name, &server.name, "connection_failed", duration.as_millis() as u64);
                 metrics::record_detailed_timing_metrics(&backend_name, &server.name, duration.as_millis() as u64, Some(connection_time.as_millis() as u64), None);
-                return Err(e.into());
-            }
-            Err(_) => {
-                let duration = start_time.elapsed();
-                let connection_time = connection_start.elapsed();
-                logger.log_error(&format!("Connection timeout after {:?}", connect_timeout));
-                metrics::request_failed(&backend_name, &server.name, "connection_timeout");
-                metrics::request_completed(&backend_name, &server.name, "connection_timeout", duration.as_millis() as u64);
-                metrics::record_detailed_timing_metrics(&backend_name, &server.name, duration.as_millis() as u64, Some(connection_time.as_millis() as u64), None);
-                return Err(anyhow!("Connection timeout after {:?}", connect_timeout));
+                return Err(anyhow!(error_msg));
             }
         };
         let connection_time = connection_start.elapsed();
