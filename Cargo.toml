@@ -1,7 +1,7 @@
 [package]
 name = "turbogate"
 version = "0.1.0"
-edition = "2025"
+edition = "2021"
 authors = ["izuna <dkapitsev@gmail.com>"]
 description = "High-performance L4 load balancer compatible with HAProxy"
 license = "MIT"
